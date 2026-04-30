@@ -1,13 +1,6 @@
 > [!IMPORTANT]
 > All rights to the assets belong to their respective authors.
 
-```console
-python -m venv venv
-\env\Scripts\activate or source venv/bin/activate
-pip install -r dependencies.py
-
-```
-
 <div align="center">
   
 ## Dependencies

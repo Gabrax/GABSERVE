@@ -1,6 +1,14 @@
 > [!IMPORTANT]
 > All rights to the assets belong to their respective authors.
 
+Przechwytywanie: DXGI Desktop Duplication
+
+Kodowanie: NVENC SDK
+
+Sieć: Winsock UDP
+
+Dekodowanie: NVDEC
+
 <div align="center">
   
 ## Dependencies

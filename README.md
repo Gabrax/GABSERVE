@@ -1,19 +1,25 @@
-# GABSERVE
-
 A simple prototype for sharing a screen and system audio over UDP on Windows.
 
 - the desktop image is scaled, encoded as JPEG, and split into UDP datagrams,
 - audio played by the computer is captured using WASAPI loopback,
 - the receiver reassembles frames, displays the image in a window, and plays audio,
 - the default endpoint is `127.0.0.1:7777`.
-
+  
+<div align="center">
+  
 ## Requirements
 
+</div>
+  
 - Windows 10 or 11,
 - Visual Studio Build Tools with MSVC, or CMake with an MSVC/Clang compiler,
 - Windows SDK.
 
+<div align="center">
+
 ## Building
+
+</div>
 
 In PowerShell:
 
@@ -28,7 +34,11 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+<div align="center">
+
 ## Running on localhost
+
+</div>
 
 Start the receiver first:
 
@@ -64,7 +74,11 @@ For a windowless test, run
 with `--test-pattern --seconds 3` to verify the complete pipeline without access
 to an interactive desktop.
 
+<div align="center">
+
 ## MVP protocol
+
+</div>
 
 Each datagram has a 36-byte `GABS` header, an object number, and a fragment index.
 The maximum data fragment is 1200 bytes to avoid IP fragmentation on a typical

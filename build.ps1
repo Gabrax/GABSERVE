@@ -14,9 +14,10 @@ if (-not $vcvars) {
 }
 
 $source = "$PSScriptRoot\gabserve.cpp"
+$h264Source = "$PSScriptRoot\mf_h264.cpp"
 $output = "$PSScriptRoot\build\gabserve.exe"
-$object = "$PSScriptRoot\build\gabserve.obj"
-$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /Fo:"{1}" /Fe:"{2}" "{3}" /link /subsystem:console ws2_32.lib ole32.lib oleaut32.lib windowscodecs.lib user32.lib gdi32.lib winmm.lib uuid.lib' -f $vcvars.FullName, $object, $output, $source
+$objectDirectory = "$PSScriptRoot\build\\"
+$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /Fo:"{1}" /Fe:"{2}" "{3}" "{4}" /link /subsystem:console ws2_32.lib ole32.lib oleaut32.lib windowscodecs.lib user32.lib gdi32.lib winmm.lib uuid.lib d3d11.lib dxgi.lib mfplat.lib mf.lib mfuuid.lib' -f $vcvars.FullName, $objectDirectory, $output, $source, $h264Source
 
 & cmd.exe /d /c $command
 

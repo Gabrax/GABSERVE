@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
+#include "mf_h264.h"
+
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -10,6 +12,9 @@
 #include <wincodec.h>
 #include <objidl.h>
 #include <propidl.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <mfapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +38,8 @@ enum class PacketKind : uint8_t {
     VideoJpeg = 1,
     AudioPcm = 2,
     AudioFormat = 3,
+    VideoConfig = 4,
+    VideoH264 = 5,
 };
 
 #pragma pack(push, 1)
@@ -48,9 +55,20 @@ struct PacketHeader {
     uint32_t total_size;
     uint64_t timestamp_us;
 };
+
+struct VideoStreamConfig {
+    uint32_t codec;
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps;
+    uint32_t bitrate;
+    uint32_t sequence_header_size;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == 36, "Unexpected protocol header size");
+static_assert(sizeof(VideoStreamConfig) == 24, "Unexpected video config size");
+constexpr uint32_t kVideoCodecH264 = 0x34363248; // H264
 
 std::atomic_bool g_running{true};
 
@@ -134,21 +152,59 @@ private:
     sockaddr_in target_{};
 };
 
+void draw_cursor(HDC target_dc, int target_width, int target_height,
+                 int source_left, int source_top, int source_width, int source_height) {
+    CURSORINFO cursor{};
+    cursor.cbSize = sizeof(cursor);
+    if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING) || !cursor.hCursor) return;
+    if (cursor.ptScreenPos.x < source_left || cursor.ptScreenPos.x >= source_left + source_width ||
+        cursor.ptScreenPos.y < source_top || cursor.ptScreenPos.y >= source_top + source_height) return;
+
+    ICONINFO icon{};
+    if (!GetIconInfo(cursor.hCursor, &icon)) return;
+    const int cursor_width = std::max(1, GetSystemMetrics(SM_CXCURSOR) * target_width / source_width);
+    const int cursor_height = std::max(1, GetSystemMetrics(SM_CYCURSOR) * target_height / source_height);
+    const int source_x = cursor.ptScreenPos.x - source_left - static_cast<int>(icon.xHotspot);
+    const int source_y = cursor.ptScreenPos.y - source_top - static_cast<int>(icon.yHotspot);
+    const int target_x = source_x * target_width / source_width;
+    const int target_y = source_y * target_height / source_height;
+    DrawIconEx(target_dc, target_x, target_y, cursor.hCursor,
+               cursor_width, cursor_height, 0, nullptr, DI_NORMAL);
+    if (icon.hbmColor) DeleteObject(icon.hbmColor);
+    if (icon.hbmMask) DeleteObject(icon.hbmMask);
+}
+
 class ScreenCapture {
 public:
-    ~ScreenCapture() {
+    virtual ~ScreenCapture() = default;
+    virtual bool initialize(int max_width) = 0;
+    virtual bool capture() = 0;
+    virtual void generate_test_pattern(uint32_t frame) = 0;
+    virtual int width() const = 0;
+    virtual int height() const = 0;
+    virtual int stride() const = 0;
+    virtual const uint8_t* pixels() const = 0;
+    virtual WICPixelFormatGUID pixel_format() const = 0;
+    virtual const char* name() const = 0;
+};
+
+class GdiScreenCapture final : public ScreenCapture {
+public:
+    ~GdiScreenCapture() override {
         if (old_bitmap_) SelectObject(memory_dc_, old_bitmap_);
         if (bitmap_) DeleteObject(bitmap_);
         if (memory_dc_) DeleteDC(memory_dc_);
         if (screen_dc_) ReleaseDC(nullptr, screen_dc_);
     }
 
-    bool initialize(int max_width) {
+    bool initialize(int max_width) override {
         source_width_ = GetSystemMetrics(SM_CXSCREEN);
         source_height_ = GetSystemMetrics(SM_CYSCREEN);
         width_ = std::min(source_width_, max_width);
         height_ = std::max(1, static_cast<int>(
             static_cast<int64_t>(source_height_) * width_ / source_width_));
+        width_ = std::max(2, width_ & ~1);
+        height_ = std::max(2, height_ & ~1);
 
         screen_dc_ = GetDC(nullptr);
         memory_dc_ = CreateCompatibleDC(screen_dc_);
@@ -171,16 +227,21 @@ public:
         return true;
     }
 
-    bool capture() {
+    bool capture() override {
+        bool captured = false;
         if (width_ == source_width_ && height_ == source_height_) {
-            return BitBlt(memory_dc_, 0, 0, width_, height_, screen_dc_, 0, 0,
-                          SRCCOPY | CAPTUREBLT) != FALSE;
+            captured = BitBlt(memory_dc_, 0, 0, width_, height_, screen_dc_, 0, 0,
+                              SRCCOPY | CAPTUREBLT) != FALSE;
+        } else {
+            captured = StretchBlt(memory_dc_, 0, 0, width_, height_, screen_dc_, 0, 0,
+                                  source_width_, source_height_, SRCCOPY) != FALSE;
         }
-        return StretchBlt(memory_dc_, 0, 0, width_, height_, screen_dc_, 0, 0,
-                          source_width_, source_height_, SRCCOPY) != FALSE;
+        if (captured)
+            draw_cursor(memory_dc_, width_, height_, 0, 0, source_width_, source_height_);
+        return captured;
     }
 
-    void generate_test_pattern(uint32_t frame) {
+    void generate_test_pattern(uint32_t frame) override {
         for (int y = 0; y < height_; ++y) {
             uint8_t* row = pixels_ + static_cast<size_t>(y) * stride_;
             for (int x = 0; x < width_; ++x) {
@@ -191,10 +252,12 @@ public:
         }
     }
 
-    int width() const { return width_; }
-    int height() const { return height_; }
-    int stride() const { return stride_; }
-    const uint8_t* pixels() const { return pixels_; }
+    int width() const override { return width_; }
+    int height() const override { return height_; }
+    int stride() const override { return stride_; }
+    const uint8_t* pixels() const override { return pixels_; }
+    WICPixelFormatGUID pixel_format() const override { return GUID_WICPixelFormat24bppBGR; }
+    const char* name() const override { return "cpu/gdi"; }
 
 private:
     HDC screen_dc_ = nullptr;
@@ -207,6 +270,180 @@ private:
     int width_ = 0;
     int height_ = 0;
     int stride_ = 0;
+};
+
+class DxgiScreenCapture final : public ScreenCapture {
+public:
+    ~DxgiScreenCapture() override {
+        if (old_bitmap_) SelectObject(memory_dc_, old_bitmap_);
+        if (bitmap_) DeleteObject(bitmap_);
+        if (memory_dc_) DeleteDC(memory_dc_);
+        release_com(staging_);
+        release_com(duplication_);
+        release_com(context_);
+        release_com(device_);
+    }
+
+    bool initialize(int max_width) override {
+        D3D_FEATURE_LEVEL feature_level{};
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+            &device_, &feature_level, &context_);
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "D3D11 device initialization failed (%s).\n", hr_text(hr));
+            return false;
+        }
+
+        IDXGIDevice* dxgi_device = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        IDXGIOutput* output = nullptr;
+        IDXGIOutput1* output1 = nullptr;
+        hr = device_->QueryInterface(IID_PPV_ARGS(&dxgi_device));
+        if (SUCCEEDED(hr)) hr = dxgi_device->GetAdapter(&adapter);
+        if (SUCCEEDED(hr)) hr = adapter->EnumOutputs(0, &output);
+        if (SUCCEEDED(hr)) hr = output->GetDesc(&output_desc_);
+        if (SUCCEEDED(hr)) hr = output->QueryInterface(IID_PPV_ARGS(&output1));
+        if (SUCCEEDED(hr)) hr = output1->DuplicateOutput(device_, &duplication_);
+        release_com(output1);
+        release_com(output);
+        release_com(adapter);
+        release_com(dxgi_device);
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "DXGI Desktop Duplication initialization failed (%s).\n", hr_text(hr));
+            return false;
+        }
+
+        source_width_ = output_desc_.DesktopCoordinates.right - output_desc_.DesktopCoordinates.left;
+        source_height_ = output_desc_.DesktopCoordinates.bottom - output_desc_.DesktopCoordinates.top;
+        width_ = std::min(source_width_, max_width);
+        height_ = std::max(1, static_cast<int>(
+            static_cast<int64_t>(source_height_) * width_ / source_width_));
+        width_ = std::max(2, width_ & ~1);
+        height_ = std::max(2, height_ & ~1);
+        stride_ = ((width_ * 3 + 3) / 4) * 4;
+
+        memory_dc_ = CreateCompatibleDC(nullptr);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width_;
+        info.bmiHeader.biHeight = -height_;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 24;
+        info.bmiHeader.biCompression = BI_RGB;
+        bitmap_ = CreateDIBSection(memory_dc_, &info, DIB_RGB_COLORS,
+                                   reinterpret_cast<void**>(&pixels_), nullptr, 0);
+        if (!memory_dc_ || !bitmap_ || !pixels_) return false;
+        old_bitmap_ = SelectObject(memory_dc_, bitmap_);
+        SetStretchBltMode(memory_dc_, HALFTONE);
+        return true;
+    }
+
+    bool capture() override {
+        DXGI_OUTDUPL_FRAME_INFO frame_info{};
+        IDXGIResource* resource = nullptr;
+        HRESULT hr = duplication_->AcquireNextFrame(50, &frame_info, &resource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+        if (FAILED(hr)) {
+            if (hr != last_capture_error_) {
+                std::fprintf(stderr, "DXGI frame acquisition failed (%s).\n", hr_text(hr));
+                last_capture_error_ = hr;
+            }
+            return false;
+        }
+
+        ID3D11Texture2D* texture = nullptr;
+        hr = resource->QueryInterface(IID_PPV_ARGS(&texture));
+        release_com(resource);
+        if (FAILED(hr)) {
+            duplication_->ReleaseFrame();
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC description{};
+        texture->GetDesc(&description);
+        if (!staging_ || description.Width != staging_width_ || description.Height != staging_height_) {
+            release_com(staging_);
+            D3D11_TEXTURE2D_DESC staging_description = description;
+            staging_description.BindFlags = 0;
+            staging_description.MiscFlags = 0;
+            staging_description.Usage = D3D11_USAGE_STAGING;
+            staging_description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            hr = device_->CreateTexture2D(&staging_description, nullptr, &staging_);
+            staging_width_ = description.Width;
+            staging_height_ = description.Height;
+        }
+        if (SUCCEEDED(hr)) context_->CopyResource(staging_, texture);
+        release_com(texture);
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(hr)) hr = context_->Map(staging_, 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            const size_t source_stride = static_cast<size_t>(description.Width) * 4;
+            raw_pixels_.resize(source_stride * description.Height);
+            for (UINT row = 0; row < description.Height; ++row) {
+                std::memcpy(raw_pixels_.data() + row * source_stride,
+                            static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                            source_stride);
+            }
+            context_->Unmap(staging_, 0);
+        }
+        duplication_->ReleaseFrame();
+        if (FAILED(hr)) return false;
+
+        BITMAPINFO source_info{};
+        source_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        source_info.bmiHeader.biWidth = static_cast<LONG>(description.Width);
+        source_info.bmiHeader.biHeight = -static_cast<LONG>(description.Height);
+        source_info.bmiHeader.biPlanes = 1;
+        source_info.bmiHeader.biBitCount = 32;
+        source_info.bmiHeader.biCompression = BI_RGB;
+        if (StretchDIBits(memory_dc_, 0, 0, width_, height_, 0, 0,
+                          description.Width, description.Height, raw_pixels_.data(),
+                          &source_info, DIB_RGB_COLORS, SRCCOPY) == GDI_ERROR) return false;
+        draw_cursor(memory_dc_, width_, height_,
+                    output_desc_.DesktopCoordinates.left, output_desc_.DesktopCoordinates.top,
+                    source_width_, source_height_);
+        last_capture_error_ = S_OK;
+        return true;
+    }
+
+    void generate_test_pattern(uint32_t frame) override {
+        for (int y = 0; y < height_; ++y) {
+            uint8_t* row = pixels_ + static_cast<size_t>(y) * stride_;
+            for (int x = 0; x < width_; ++x) {
+                row[x * 3 + 0] = static_cast<uint8_t>((x + frame * 5) & 0xFF);
+                row[x * 3 + 1] = static_cast<uint8_t>((y + frame * 3) & 0xFF);
+                row[x * 3 + 2] = static_cast<uint8_t>((x + y + frame * 7) & 0xFF);
+            }
+        }
+    }
+
+    int width() const override { return width_; }
+    int height() const override { return height_; }
+    int stride() const override { return stride_; }
+    const uint8_t* pixels() const override { return pixels_; }
+    WICPixelFormatGUID pixel_format() const override { return GUID_WICPixelFormat24bppBGR; }
+    const char* name() const override { return "gpu/dxgi"; }
+
+private:
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    IDXGIOutputDuplication* duplication_ = nullptr;
+    ID3D11Texture2D* staging_ = nullptr;
+    DXGI_OUTPUT_DESC output_desc_{};
+    HDC memory_dc_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ old_bitmap_ = nullptr;
+    uint8_t* pixels_ = nullptr;
+    std::vector<uint8_t> raw_pixels_;
+    UINT staging_width_ = 0;
+    UINT staging_height_ = 0;
+    int source_width_ = 0;
+    int source_height_ = 0;
+    int width_ = 0;
+    int height_ = 0;
+    int stride_ = 0;
+    HRESULT last_capture_error_ = S_OK;
 };
 
 class JpegCodec {
@@ -244,9 +481,9 @@ public:
         }
         if (SUCCEEDED(hr)) hr = frame->Initialize(properties);
         if (SUCCEEDED(hr)) hr = frame->SetSize(capture.width(), capture.height());
-        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        WICPixelFormatGUID format = capture.pixel_format();
         if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
-        if (SUCCEEDED(hr) && format != GUID_WICPixelFormat24bppBGR) hr = E_FAIL;
+        if (SUCCEEDED(hr) && !IsEqualGUID(format, capture.pixel_format())) hr = E_FAIL;
         if (SUCCEEDED(hr)) hr = frame->WritePixels(capture.height(), capture.stride(),
             capture.stride() * capture.height(), const_cast<BYTE*>(capture.pixels()));
         if (SUCCEEDED(hr)) hr = frame->Commit();
@@ -496,14 +733,62 @@ struct VideoFrame {
 
 VideoFrame g_video_frame;
 
+class PaintBackBuffer {
+public:
+    ~PaintBackBuffer() { reset(); }
+
+    bool ensure(HDC reference, int width, int height) {
+        if (width <= 0 || height <= 0) return false;
+        if (dc_ && width == width_ && height == height_) return true;
+        reset();
+        dc_ = CreateCompatibleDC(reference);
+        bitmap_ = CreateCompatibleBitmap(reference, width, height);
+        if (!dc_ || !bitmap_) {
+            reset();
+            return false;
+        }
+        old_bitmap_ = SelectObject(dc_, bitmap_);
+        width_ = width;
+        height_ = height;
+        return true;
+    }
+
+    void reset() {
+        if (dc_ && old_bitmap_) SelectObject(dc_, old_bitmap_);
+        if (bitmap_) DeleteObject(bitmap_);
+        if (dc_) DeleteDC(dc_);
+        dc_ = nullptr;
+        bitmap_ = nullptr;
+        old_bitmap_ = nullptr;
+        width_ = 0;
+        height_ = 0;
+    }
+
+    HDC dc() const { return dc_; }
+
+private:
+    HDC dc_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ old_bitmap_ = nullptr;
+    int width_ = 0;
+    int height_ = 0;
+};
+
+PaintBackBuffer g_paint_buffer;
+
 LRESULT CALLBACK receiver_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
         RECT client{};
         GetClientRect(window, &client);
-        FillRect(dc, &client, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        if (!g_video_frame.pixels.empty()) {
+        const int client_width = client.right - client.left;
+        const int client_height = client.bottom - client.top;
+        if (g_paint_buffer.ensure(dc, client_width, client_height)) {
+            FillRect(g_paint_buffer.dc(), &client,
+                     reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        }
+        if (g_paint_buffer.dc() && !g_video_frame.pixels.empty()) {
             BITMAPINFO info{};
             info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             info.bmiHeader.biWidth = static_cast<LONG>(g_video_frame.width);
@@ -511,15 +796,18 @@ LRESULT CALLBACK receiver_window_proc(HWND window, UINT message, WPARAM wparam, 
             info.bmiHeader.biPlanes = 1;
             info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = BI_RGB;
-            StretchDIBits(dc, 0, 0, client.right, client.bottom,
+            StretchDIBits(g_paint_buffer.dc(), 0, 0, client_width, client_height,
                 0, 0, g_video_frame.width, g_video_frame.height,
                 g_video_frame.pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY);
         }
+        if (g_paint_buffer.dc())
+            BitBlt(dc, 0, 0, client_width, client_height, g_paint_buffer.dc(), 0, 0, SRCCOPY);
         EndPaint(window, &paint);
         return 0;
     }
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_DESTROY) {
+        g_paint_buffer.reset();
         g_running.store(false);
         PostQuitMessage(0);
         return 0;
@@ -560,6 +848,9 @@ struct Options {
     bool audio = true;
     bool headless = false;
     bool test_pattern = false;
+    std::string video_backend = "cpu";
+    std::string video_codec = "h264";
+    int bitrate_kbps = 4000;
     int seconds = 0;
 };
 
@@ -568,7 +859,9 @@ void print_usage() {
         "GABSERVE - screen and audio over UDP\n\n"
         "  gabserve receive [--bind 127.0.0.1] [--port 7777] [--no-audio]\n"
         "  gabserve send    [--host 127.0.0.1] [--port 7777]\n"
-        "                    [--fps 10] [--width 1280] [--quality 0.65] [--no-audio]\n"
+        "                    [--video-backend cpu|gpu] [--video-codec h264|jpeg]\n"
+        "                    [--bitrate 4000] [--fps 10] [--width 1280]\n"
+        "                    [--quality 0.65] [--no-audio]\n"
         "  test: add --headless --seconds 5 to the receiver\n\n"
         "Start receive first, then send. Ctrl+C stops transmission.\n");
 }
@@ -598,6 +891,12 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.headless = true;
         } else if (argument == "--test-pattern") {
             options.test_pattern = true;
+        } else if (argument == "--video-backend") {
+            value = next(); if (!value) return false; options.video_backend = value;
+        } else if (argument == "--video-codec") {
+            value = next(); if (!value) return false; options.video_codec = value;
+        } else if (argument == "--bitrate") {
+            value = next(); if (!value) return false; options.bitrate_kbps = std::atoi(value);
         } else if (argument == "--seconds") {
             value = next(); if (!value) return false; options.seconds = std::atoi(value);
         } else {
@@ -607,7 +906,10 @@ bool parse_options(int argc, char** argv, Options& options) {
     return (options.mode == "send" || options.mode == "receive") && options.port > 0 &&
         options.fps >= 1 && options.fps <= 60 && options.max_width >= 160 &&
         options.max_width <= 7680 && options.quality >= 0.1f && options.quality <= 1.0f &&
-        options.seconds >= 0 && options.seconds <= 86400;
+        options.seconds >= 0 && options.seconds <= 86400 &&
+        options.bitrate_kbps >= 100 && options.bitrate_kbps <= 100000 &&
+        (options.video_backend == "cpu" || options.video_backend == "gpu") &&
+        (options.video_codec == "h264" || options.video_codec == "jpeg");
 }
 
 int run_sender(const Options& options) {
@@ -616,42 +918,105 @@ int run_sender(const Options& options) {
         std::fprintf(stderr, "Could not open the UDP socket (%d).\n", WSAGetLastError());
         return 1;
     }
-    ScreenCapture screen;
-    if (!screen.initialize(options.max_width)) {
-        std::fprintf(stderr, "Could not initialize screen capture.\n");
+    std::unique_ptr<ScreenCapture> screen;
+    if (options.video_backend == "gpu")
+        screen = std::make_unique<DxgiScreenCapture>();
+    else
+        screen = std::make_unique<GdiScreenCapture>();
+    if (!screen->initialize(options.max_width)) {
+        std::fprintf(stderr, "Could not initialize the %s screen capture backend.\n",
+                     options.video_backend.c_str());
         return 1;
     }
-    JpegCodec codec;
-    if (!codec.initialize()) return 1;
+    std::unique_ptr<JpegCodec> jpeg_codec;
+    std::unique_ptr<MfH264Encoder> h264_encoder;
+    VideoStreamConfig video_config{};
+    if (options.video_codec == "jpeg") {
+        jpeg_codec = std::make_unique<JpegCodec>();
+        if (!jpeg_codec->initialize()) return 1;
+    } else {
+        h264_encoder = std::make_unique<MfH264Encoder>();
+        H264EncoderConfig encoder_config{};
+        encoder_config.width = screen->width();
+        encoder_config.height = screen->height();
+        encoder_config.fps = options.fps;
+        encoder_config.bitrate = static_cast<uint32_t>(options.bitrate_kbps) * 1000;
+        encoder_config.prefer_hardware = options.video_backend == "gpu";
+        if (!h264_encoder->initialize(encoder_config)) return 1;
+        video_config.codec = kVideoCodecH264;
+        video_config.width = screen->width();
+        video_config.height = screen->height();
+        video_config.fps = options.fps;
+        video_config.bitrate = encoder_config.bitrate;
+    }
 
     std::thread audio_thread;
     if (options.audio) audio_thread = std::thread(audio_capture_loop, &sender);
-    std::printf("Transmitting to %s:%u | %dx%d | %d FPS | JPEG %.0f%%\n",
-        options.address.c_str(), options.port, screen.width(), screen.height(),
-        options.fps, options.quality * 100.0f);
+    const char* codec_name = options.video_codec == "h264"
+        ? h264_encoder->backend_name().c_str() : "wic-jpeg";
+    std::printf("Transmitting to %s:%u | %dx%d | %d FPS | %s | %s\n",
+        options.address.c_str(), options.port, screen->width(), screen->height(),
+        options.fps, codec_name, screen->name());
 
     uint32_t frame_id = 1;
+    uint32_t capture_id = 1;
+    uint32_t config_id = 1;
     uint64_t captured_frames = 0;
     uint64_t encoded_frames = 0;
     uint64_t sent_frames = 0;
-    std::vector<uint8_t> jpeg;
+    std::vector<uint8_t> encoded_frame;
     const auto frame_duration = std::chrono::microseconds(1000000 / options.fps);
     auto deadline = std::chrono::steady_clock::now();
     const auto stop_time = options.seconds > 0
         ? std::chrono::steady_clock::now() + std::chrono::seconds(options.seconds)
         : std::chrono::steady_clock::time_point::max();
+    auto next_config = std::chrono::steady_clock::now();
+    bool video_config_due = h264_encoder != nullptr;
+    bool video_config_sent = false;
     while (g_running.load()) {
         if (std::chrono::steady_clock::now() >= stop_time) break;
         deadline += frame_duration;
+        const auto current = std::chrono::steady_clock::now();
+        if (h264_encoder && current >= next_config) {
+            h264_encoder->request_keyframe();
+            video_config_due = true;
+            next_config = current + std::chrono::seconds(1);
+        }
         const bool captured = options.test_pattern
-            ? (screen.generate_test_pattern(frame_id), true)
-            : screen.capture();
+            ? (screen->generate_test_pattern(capture_id++), true)
+            : screen->capture();
         if (captured) {
             ++captured_frames;
-            if (codec.encode(screen, options.quality, jpeg)) {
+            bool encoded = false;
+            PacketKind packet_kind = PacketKind::VideoJpeg;
+            if (jpeg_codec) {
+                encoded = jpeg_codec->encode(*screen, options.quality, encoded_frame);
+            } else {
+                packet_kind = PacketKind::VideoH264;
+                encoded = h264_encoder->encode_bgr24(
+                    screen->pixels(), screen->stride(), encoded_frame);
+            }
+            if (encoded) {
                 ++encoded_frames;
-                if (sender.send_object(PacketKind::VideoJpeg, frame_id++, jpeg.data(),
-                                       static_cast<uint32_t>(jpeg.size()), now_us())) {
+                if (h264_encoder && video_config_due) {
+                    const auto& sequence_header = h264_encoder->sequence_header();
+                    if (!sequence_header.empty()) {
+                        video_config.sequence_header_size =
+                            static_cast<uint32_t>(sequence_header.size());
+                        std::vector<uint8_t> config_payload(
+                            sizeof(video_config) + sequence_header.size());
+                        std::memcpy(config_payload.data(), &video_config, sizeof(video_config));
+                        std::memcpy(config_payload.data() + sizeof(video_config),
+                                    sequence_header.data(), sequence_header.size());
+                        video_config_sent = sender.send_object(
+                            PacketKind::VideoConfig, config_id++, config_payload.data(),
+                            static_cast<uint32_t>(config_payload.size()), now_us());
+                        video_config_due = !video_config_sent;
+                    }
+                }
+                if (h264_encoder && !video_config_sent) continue;
+                if (sender.send_object(packet_kind, frame_id++, encoded_frame.data(),
+                                       static_cast<uint32_t>(encoded_frame.size()), now_us())) {
                     ++sent_frames;
                 } else {
                 std::fprintf(stderr, "sendto failed: %d\n", WSAGetLastError());
@@ -665,7 +1030,7 @@ int run_sender(const Options& options) {
     g_running.store(false);
     if (audio_thread.joinable()) audio_thread.join();
     if (options.seconds > 0)
-        std::printf("Statistics: captured=%llu, JPEG=%llu, transmitted=%llu.\n",
+        std::printf("Statistics: captured=%llu, encoded=%llu, transmitted=%llu.\n",
                     static_cast<unsigned long long>(captured_frames),
                     static_cast<unsigned long long>(encoded_frames),
                     static_cast<unsigned long long>(sent_frames));
@@ -716,9 +1081,14 @@ int run_receiver(const Options& options, HINSTANCE instance) {
         return 1;
     }
     AudioPlayer audio;
-    Assembly video_assembly;
+    Assembly jpeg_assembly;
+    Assembly h264_assembly;
+    Assembly video_config_assembly;
     Assembly audio_assembly;
     Assembly format_assembly;
+    std::unique_ptr<MfH264Decoder> h264_decoder;
+    VideoStreamConfig active_video_config{};
+    std::vector<uint8_t> active_sequence_header;
     std::vector<uint8_t> packet(sizeof(PacketHeader) + kPayloadBytes);
     uint64_t video_frames = 0;
     uint64_t total_video_frames = 0;
@@ -756,7 +1126,9 @@ int run_receiver(const Options& options, HINSTANCE instance) {
             const uint8_t* payload = packet.data() + sizeof(PacketHeader);
             Assembly* assembly = nullptr;
             const PacketKind kind = static_cast<PacketKind>(header.kind);
-            if (kind == PacketKind::VideoJpeg) assembly = &video_assembly;
+            if (kind == PacketKind::VideoJpeg) assembly = &jpeg_assembly;
+            else if (kind == PacketKind::VideoH264) assembly = &h264_assembly;
+            else if (kind == PacketKind::VideoConfig) assembly = &video_config_assembly;
             else if (kind == PacketKind::AudioPcm) assembly = &audio_assembly;
             else if (kind == PacketKind::AudioFormat) assembly = &format_assembly;
             else continue;
@@ -775,9 +1147,46 @@ int run_receiver(const Options& options, HINSTANCE instance) {
                 } else {
                     ++video_decode_failures;
                 }
+            } else if (kind == PacketKind::VideoConfig) {
+                if (assembly->data.size() < sizeof(VideoStreamConfig)) continue;
+                VideoStreamConfig config{};
+                std::memcpy(&config, assembly->data.data(), sizeof(config));
+                if (config.codec != kVideoCodecH264 || config.width < 2 || config.height < 2 ||
+                    config.width > 8192 || config.height > 8192 || config.fps == 0 ||
+                    config.fps > 240 || (config.width & 1) || (config.height & 1) ||
+                    config.sequence_header_size == 0 || config.sequence_header_size > 65536 ||
+                    assembly->data.size() != sizeof(config) + config.sequence_header_size) continue;
+                const uint8_t* sequence_header = assembly->data.data() + sizeof(config);
+                const bool header_changed = active_sequence_header.size() != config.sequence_header_size ||
+                    !std::equal(sequence_header, sequence_header + config.sequence_header_size,
+                                active_sequence_header.begin());
+                if (std::memcmp(&config, &active_video_config, sizeof(config)) != 0 || header_changed) {
+                    auto decoder = std::make_unique<MfH264Decoder>();
+                    if (decoder->initialize(config.width, config.height, config.fps,
+                                            sequence_header, config.sequence_header_size)) {
+                        h264_decoder = std::move(decoder);
+                        active_video_config = config;
+                        active_sequence_header.assign(
+                            sequence_header, sequence_header + config.sequence_header_size);
+                        std::printf("H.264 stream configured: %ux%u, %u FPS, %u kbps.\n",
+                                    config.width, config.height, config.fps,
+                                    config.bitrate / 1000);
+                    }
+                }
+            } else if (kind == PacketKind::VideoH264) {
+                ++video_objects_completed;
+                if (h264_decoder && h264_decoder->decode(
+                        assembly->data.data(), static_cast<uint32_t>(assembly->data.size()),
+                        g_video_frame.pixels)) {
+                    g_video_frame.width = active_video_config.width;
+                    g_video_frame.height = active_video_config.height;
+                    ++video_frames;
+                    ++total_video_frames;
+                    if (window) InvalidateRect(window, nullptr, FALSE);
+                }
             } else if (kind == PacketKind::AudioPcm) {
                 if (options.audio) audio.enqueue(assembly->data);
-            } else {
+            } else if (kind == PacketKind::AudioFormat) {
                 if (options.audio) audio.set_format(assembly->data);
             }
         }
@@ -807,6 +1216,7 @@ int run_receiver(const Options& options, HINSTANCE instance) {
 } // namespace
 
 int main(int argc, char** argv) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     Options options;
     if (!parse_options(argc, argv, options)) {
         print_usage();
@@ -821,9 +1231,15 @@ int main(int argc, char** argv) {
     const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     int result = 1;
     if (SUCCEEDED(com_hr)) {
-        result = options.mode == "send"
-            ? run_sender(options)
-            : run_receiver(options, GetModuleHandleW(nullptr));
+        const HRESULT mf_hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (SUCCEEDED(mf_hr)) {
+            result = options.mode == "send"
+                ? run_sender(options)
+                : run_receiver(options, GetModuleHandleW(nullptr));
+            MFShutdown();
+        } else {
+            std::fprintf(stderr, "Media Foundation startup failed: %s\n", hr_text(mf_hr));
+        }
         CoUninitialize();
     } else {
         std::fprintf(stderr, "COM init: %s\n", hr_text(com_hr));
